@@ -11,6 +11,120 @@ type WsWrite = futures_util::stream::SplitSink<
 type WsRead = futures_util::stream::SplitStream<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>;
 
+/// Runs a single command over the terminal WebSocket and returns its exit code.
+///
+/// This is the fallback used when the server has no REST `/exec` endpoint. It drives the
+/// remote PTY shell directly: it brackets the command with unique sentinel markers, then
+/// scrapes the output stream between them. Merged stdout/stderr is printed to our stdout
+/// (a PTY can't separate the two), and the exit code is parsed from the trailing marker.
+pub async fn run_command(ws_url: &str, command: &str) -> Result<i32> {
+    use tokio::time::{timeout, Duration, Instant};
+
+    let (ws, _) = connect_async(ws_url).await.context("WebSocket connect failed")?;
+    let (mut tx, mut rx) = ws.split();
+    // Wide terminal to minimise line wrapping in scraped output.
+    tx.send(Message::Text("\x01300,50".into())).await?;
+
+    let tok = format!("{:x}", std::process::id());
+    let start = format!("__NT_START_{tok}__");
+    let exit_prefix = format!("__NT_EXIT_{tok}__");
+    // The leading newline in each printf guarantees the markers land on their own line,
+    // even when the command's output has no trailing newline. `$?` is captured before the
+    // final printf so the exit code reflects the user's command, not the printf.
+    let script = format!(
+        "printf '\\n%s\\n' '{start}'; ( {command} ); __ntc=$?; printf '\\n%s%d\\n' '{exit_prefix}' \"$__ntc\"\n"
+    );
+
+    // Disable terminal echo first (as its own line) so the PTY doesn't echo the marker
+    // scaffolding back into the session that others might be viewing. It only takes effect
+    // for input read after it runs, hence the brief pause before sending the actual command.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    tx.send(Message::Text("stty -echo 2>/dev/null\n".into())).await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    tx.send(Message::Text(script)).await?;
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut buf = String::new();
+    let mut capturing = false;
+    let mut out = String::new();
+    let mut exit_code: Option<i32> = None;
+
+    'outer: loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("Command timed out after 120s (no completion marker received)");
+        }
+        let msg = match timeout(remaining, rx.next()).await {
+            Err(_) => anyhow::bail!("Command timed out after 120s"),
+            Ok(m) => m,
+        };
+        match msg {
+            Some(Ok(Message::Text(t))) if t.starts_with('\x02') => {
+                anyhow::bail!("Server requested interactive 2FA, which non-interactive exec cannot satisfy");
+            }
+            Some(Ok(Message::Text(t))) => buf.push_str(&t),
+            Some(Ok(Message::Binary(d))) => buf.push_str(&String::from_utf8_lossy(&d)),
+            Some(Ok(Message::Close(_))) | None => break,
+            Some(Err(e)) => return Err(e.into()),
+            _ => {}
+        }
+        while let Some(pos) = buf.find('\n') {
+            let raw: String = buf.drain(..=pos).collect();
+            let line = strip_ansi(&raw);
+            let line = line.trim_end_matches(['\r', '\n']);
+            if !capturing {
+                if line == start { capturing = true; }
+            } else if let Some(rest) = line.strip_prefix(&exit_prefix) {
+                exit_code = Some(rest.trim().parse().unwrap_or(-1));
+                break 'outer;
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+
+    // Cancel the single newline the exit-marker printf injected before its output.
+    if out.ends_with('\n') { out.pop(); }
+    print!("{out}");
+    use std::io::Write;
+    io::stdout().flush().ok();
+    Ok(exit_code.unwrap_or(1))
+}
+
+/// Removes ANSI escape sequences (CSI, OSC, and 2-byte escapes) and bell characters
+/// so scraped terminal output is plain text.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    while let Some(&n) = chars.peek() {
+                        chars.next();
+                        if ('@'..='~').contains(&n) { break; }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(&n) = chars.peek() {
+                        if n == '\x07' { chars.next(); break; }
+                        if n == '\x1b' { chars.next(); if chars.peek() == Some(&'\\') { chars.next(); } break; }
+                        chars.next();
+                    }
+                }
+                Some(_) => { chars.next(); }
+                None => {}
+            },
+            '\x07' => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 pub async fn run_session(ws_url: &str) -> Result<()> {
     let (ws, _) = connect_async(ws_url).await.context("WebSocket connect failed")?;
     let (mut tx, mut rx) = ws.split();

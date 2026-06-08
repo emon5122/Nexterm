@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::io::IsTerminal;
 use console::style;
 use dialoguer::Select;
 use crate::api::{ApiClient, flatten_entries};
@@ -20,6 +21,12 @@ async fn setup(target: &str) -> Result<(ApiClient, u64, Option<u64>, String)> {
 }
 
 pub async fn interactive(target: &str) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "No command given and stdin is not a terminal.\n\
+             For non-interactive use, pass a command like SSH: nt connect {target} \"ls -la\""
+        );
+    }
     let (client, entry_id, identity_id, name) = setup(target).await?;
     println!("Connecting to {} ...", style(&name).bold().green());
     let conn = client.create_connection(entry_id, identity_id).await?;
@@ -30,14 +37,26 @@ pub async fn interactive(target: &str) -> Result<()> {
 
 pub async fn exec(target: &str, command: &str) -> Result<()> {
     let (client, entry_id, identity_id, _) = setup(target).await?;
-    let resp = client.exec_command(entry_id, identity_id, command).await?;
-    if let Some(stdout) = &resp.stdout { if !stdout.is_empty() { print!("{stdout}"); } }
-    if let Some(stderr) = &resp.stderr { if !stderr.is_empty() { eprint!("{stderr}"); } }
-    let exit_code = resp.exit_code.unwrap_or(if resp.success { 0 } else { 1 });
-    if exit_code != 0 {
-        if let Some(err) = &resp.error_message { eprintln!("{}: {}", style("Error").red().bold(), err); }
-        std::process::exit(exit_code);
-    }
+    let exit_code = match client.exec_command(entry_id, identity_id, command).await? {
+        Some(resp) => {
+            if let Some(stdout) = &resp.stdout { if !stdout.is_empty() { print!("{stdout}"); } }
+            if let Some(stderr) = &resp.stderr { if !stderr.is_empty() { eprint!("{stderr}"); } }
+            let code = resp.exit_code.unwrap_or(if resp.success { 0 } else { 1 });
+            if code != 0 {
+                if let Some(err) = &resp.error_message { eprintln!("{}: {}", style("Error").red().bold(), err); }
+            }
+            code
+        }
+        // Server has no REST exec endpoint: run the command over the terminal WebSocket.
+        None => {
+            let conn = client.create_connection(entry_id, identity_id).await?;
+            let result = terminal::run_command(&client.ws_url(&conn.session_id)?, command).await;
+            // Always tear the session down so we don't leak connections on the server.
+            let _ = client.delete_connection(&conn.session_id).await;
+            result?
+        }
+    };
+    if exit_code != 0 { std::process::exit(exit_code); }
     Ok(())
 }
 

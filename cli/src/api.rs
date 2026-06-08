@@ -203,15 +203,26 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
-    pub async fn exec_command(&self, entry_id: u64, identity_id: Option<u64>, command: &str) -> Result<ExecResponse> {
+    /// Runs a command via the REST exec endpoint. Returns `Ok(None)` when the server
+    /// does not expose the endpoint (404), so the caller can fall back to terminal exec.
+    pub async fn exec_command(&self, entry_id: u64, identity_id: Option<u64>, command: &str) -> Result<Option<ExecResponse>> {
         let mut url = format!("/connections/{}/exec", entry_id);
         if let Some(iid) = identity_id { url = format!("{url}?identityId={iid}"); }
         let resp = self.client.post(self.url(&url))
             .header("Authorization", self.auth()?)
             .json(&serde_json::json!({"command": command}))
             .send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND { return Ok(None); }
         if !resp.status().is_success() { bail!("Exec failed: {}", resp.status()); }
-        Ok(resp.json().await?)
+        Ok(Some(resp.json().await?))
+    }
+
+    pub async fn delete_connection(&self, session_id: &str) -> Result<()> {
+        let resp = self.client.delete(self.url(&format!("/connections/{session_id}")))
+            .header("Authorization", self.auth()?)
+            .send().await?;
+        if !resp.status().is_success() { bail!("Failed to close session: {}", resp.status()); }
+        Ok(())
     }
 
     pub fn ws_url(&self, session_id: &str) -> Result<String> {
