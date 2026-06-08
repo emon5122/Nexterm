@@ -35,12 +35,14 @@ pub async fn run_command(ws_url: &str, command: &str) -> Result<i32> {
         "printf '\\n%s\\n' '{start}'; ( {command} ); __ntc=$?; printf '\\n%s%d\\n' '{exit_prefix}' \"$__ntc\"\n"
     );
 
-    // Disable terminal echo first (as its own line) so the PTY doesn't echo the marker
-    // scaffolding back into the session that others might be viewing. It only takes effect
-    // for input read after it runs, hence the brief pause before sending the actual command.
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    // Wait for the shell to actually be ready before sending input. A cold connection (e.g. the
+    // session created right after a previous one was torn down) can take seconds to attach the
+    // PTY; sending too early loses the input. We wait for the connection's first output, then for
+    // the MOTD/prompt to go idle. Disabling echo on its own line keeps the marker scaffolding out
+    // of the live session; we drain its resulting prompt before sending the actual command.
+    wait_until_idle(&mut rx, Duration::from_secs(30), Duration::from_millis(500)).await?;
     tx.send(Message::Text("stty -echo 2>/dev/null\n".into())).await?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_until_idle(&mut rx, Duration::from_secs(5), Duration::from_millis(300)).await?;
     tx.send(Message::Text(script)).await?;
 
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -90,6 +92,25 @@ pub async fn run_command(ws_url: &str, command: &str) -> Result<i32> {
     use std::io::Write;
     io::stdout().flush().ok();
     Ok(exit_code.unwrap_or(1))
+}
+
+/// Drains incoming terminal output until the shell goes quiet, signalling it is ready for input.
+/// Waits up to `first` for the connection's initial output, then returns once no data has
+/// arrived for `idle`. Bails on a 2FA prompt or a closed session.
+async fn wait_until_idle(rx: &mut WsRead, first: tokio::time::Duration, idle: tokio::time::Duration) -> Result<()> {
+    use tokio::time::timeout;
+    let mut wait = first;
+    loop {
+        match timeout(wait, rx.next()).await {
+            Err(_) => return Ok(()), // quiet long enough — shell is ready
+            Ok(None) | Ok(Some(Ok(Message::Close(_)))) => anyhow::bail!("Session closed before it was ready"),
+            Ok(Some(Ok(Message::Text(t)))) if t.starts_with('\x02') => {
+                anyhow::bail!("Server requested interactive 2FA, which non-interactive exec cannot satisfy");
+            }
+            Ok(Some(Err(e))) => return Err(e.into()),
+            Ok(Some(Ok(_))) => { wait = idle; } // got output; keep draining with the shorter idle window
+        }
+    }
 }
 
 /// Removes ANSI escape sequences (CSI, OSC, and 2-byte escapes) and bell characters
