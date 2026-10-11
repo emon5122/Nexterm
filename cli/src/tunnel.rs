@@ -3,7 +3,6 @@ use console::style;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::api::{ApiClient, flatten_entries};
@@ -43,7 +42,7 @@ pub async fn forward(target: &str, local_port: u16, remote_host: &str, remote_po
 }
 
 async fn handle_connection(tcp_stream: tokio::net::TcpStream, ws_url: &str) -> Result<()> {
-    let (ws_stream, _) = connect_async(ws_url).await?;
+    let (ws_stream, _) = crate::ws::connect(ws_url).await?;
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
     let (mut tcp_rx, mut tcp_tx) = tcp_stream.into_split();
 

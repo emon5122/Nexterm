@@ -3,13 +3,10 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal;
 use futures_util::{SinkExt, StreamExt};
 use std::io::{self, Write};
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-type WsWrite = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>;
-type WsRead = futures_util::stream::SplitStream<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>;
+type WsWrite = futures_util::stream::SplitSink<crate::ws::WsStream, Message>;
+type WsRead = futures_util::stream::SplitStream<crate::ws::WsStream>;
 
 /// Runs a single command over the terminal WebSocket and returns its exit code.
 ///
@@ -20,7 +17,7 @@ type WsRead = futures_util::stream::SplitStream<
 pub async fn run_command(ws_url: &str, command: &str) -> Result<i32> {
     use tokio::time::{timeout, Duration, Instant};
 
-    let (ws, _) = connect_async(ws_url).await.context("WebSocket connect failed")?;
+    let (ws, _) = crate::ws::connect(ws_url).await.context("WebSocket connect failed")?;
     let (mut tx, mut rx) = ws.split();
     // Wide terminal to minimise line wrapping in scraped output.
     tx.send(Message::Text("\x01300,50".into())).await?;
@@ -147,7 +144,7 @@ fn strip_ansi(s: &str) -> String {
 }
 
 pub async fn run_session(ws_url: &str) -> Result<()> {
-    let (ws, _) = connect_async(ws_url).await.context("WebSocket connect failed")?;
+    let (ws, _) = crate::ws::connect(ws_url).await.context("WebSocket connect failed")?;
     let (mut tx, mut rx) = ws.split();
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
     tx.send(Message::Text(format!("\x01{cols},{rows}"))).await?;

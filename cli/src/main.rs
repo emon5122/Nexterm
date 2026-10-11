@@ -5,6 +5,7 @@ mod connect;
 mod entries;
 mod terminal;
 mod tunnel;
+mod ws;
 
 use clap::{Parser, Subcommand};
 
